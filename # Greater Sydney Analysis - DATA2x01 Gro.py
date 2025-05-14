@@ -1,5 +1,4 @@
-# Greater Sydney Analysis - DATA2x01 Group Assignment
-# Team Members: [Insert your team members' names]
+
 # Selected SA4 Zones: Sydney - Eastern Suburbs, Sydney - Inner West, Sydney - North Sydney and Hornsby
 
 import pandas as pd
