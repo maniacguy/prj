@@ -29,10 +29,9 @@ if not os.path.exists('results'):
 
 # Connect to PostgreSQL database
 def connect_to_db():
-    # Update these with your database credentials
     username = "postgres"
-    password = "postgres"  # Update this with your actual password
-    database = "sydney_analysis"
+    password = "Thinh123!"  
+    database = "johnduong"
     
     # Create connection string
     connection_string = f"postgresql://{username}:{password}@localhost:5432/{database}"
