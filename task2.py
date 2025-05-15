@@ -1,188 +1,147 @@
-def get_bounding_box(geometry):
-    minx, miny, maxx, maxy = geometry.bounds
-    return minx, miny, maxx, maxy
+import requests
+import time
+import pg8000
+import geopandas as gpd
 
-# Function to fetch points of interest within a bounding box
-def fetch_points_of_interest(minx, miny, maxx, maxy):
-    """
-    Fetches all points of interest within a given bounding box using the NSW Points of Interest API.
-    
-    Parameters:
-    minx, miny, maxx, maxy: The coordinates defining the bounding box
-    
-    Returns:
-    A list of POI features within the bounding box
-    """
-    # NSW Points of Interest API base URL
-    base_url = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0/query"
-    
-    # Define the bounding box as a parameter for the API request
-    bbox_str = f"{minx},{miny},{maxx},{maxy}"
-    
-    # Define parameters for the API request
-    params = {
-        'geometry': bbox_str,
-        'geometryType': 'esriGeometryEnvelope',
-        'spatialRel': 'esriSpatialRelIntersects',
-        'outFields': '*',  # Request all fields
-        'returnGeometry': 'true',
-        'f': 'json'  # Request response in JSON format
-    }
-    
-    # Make the API request
-    response = requests.get(base_url, params=params)
-    
-    # Check if the request was successful
-    if response.status_code == 200:
-        data = response.json()
-        if 'features' in data:
-            return data['features']
-        else:
-            print("No features found in the response.")
+class NSWPointsOfInterestAPI:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+    def get_poi_within_bbox(self, min_lat, min_lon, max_lat, max_lon):
+        """
+        i) Return all points of interest within bounding box (min_lat, min_lon, max_lat, max_lon)
+        """
+        url = f"{self.base_url}/query"
+        params = {
+            "f": "json",
+            "geometry": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "geometryType": "esriGeometryEnvelope",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "*"
+        }
+
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("features", [])
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error fetching POI data: {e}")
             return []
-    else:
-        print(f"Error fetching data: {response.status_code}")
-        return []
 
-# Function to process and convert API response into a DataFrame
-def process_poi_response(features):
-    """
-    Process the API response features into a pandas DataFrame
-    """
-    if not features:
-        return pd.DataFrame()
-    
-    # Extract attributes and geometry for each feature
-    poi_data = []
-    for feature in features:
-        attributes = feature['attributes']
-        geometry = feature.get('geometry', {})
-        
-        # Add coordinates to attributes
-        if geometry:
-            attributes['x_coord'] = geometry.get('x')
-            attributes['y_coord'] = geometry.get('y')
-        
-        poi_data.append(attributes)
-    
-    # Convert to DataFrame
-    poi_df = pd.DataFrame(poi_data)
-    
-    # Select relevant columns - adjust as needed based on the actual API response
-    relevant_columns = [
-        'NAME', 'DESCRIPTION', 'POITYPE', 'POIgroup', 'CLASS', 'FTYPE', 
-        'x_coord', 'y_coord'
-    ]
-    
-    # Filter columns that exist in the dataframe
-    existing_columns = [col for col in relevant_columns if col in poi_df.columns]
-    poi_df = poi_df[existing_columns]
-    
-    # Rename columns to lowercase for consistency
-    poi_df.columns = [col.lower() for col in poi_df.columns]
-    
-    return poi_df
+class SA2DataProcessor:
+    def __init__(self, db_config, shapefile_path, poi_api, selected_sa4):
+        self.db_config = db_config
+        self.shapefile_path = shapefile_path
+        self.poi_api = poi_api
+        self.selected_sa4 = selected_sa4  # SA4 code to filter SA2 regions within it
 
-# Function to create a GeoDataFrame from POI data
-def create_poi_geodataframe(poi_df):
-    """
-    Convert POI DataFrame to GeoDataFrame with Point geometry
-    """
-    if poi_df.empty:
-        return gpd.GeoDataFrame()
-    
-    # Create geometry column from coordinates
-    if 'x_coord' in poi_df.columns and 'y_coord' in poi_df.columns:
-        # Create GeoDataFrame
-        poi_gdf = gpd.GeoDataFrame(
-            poi_df,
-            geometry=gpd.points_from_xy(poi_df.x_coord, poi_df.y_coord),
-            crs="EPSG:4326"  # Assuming the API returns WGS84 coordinates
+    def connect(self):
+        try:
+            conn = pg8000.connect(**self.db_config)
+            print("✅ Connected to PostgreSQL!")
+            return conn
+        except Exception as e:
+            print(f"❌ Database connection error: {e}")
+            return None
+
+    def insert_pois(self, conn, pois):
+        """
+        iii) Insert POIs into DB with meaningful columns, respecting NSW Topographic Data Dictionary.
+        Adjust columns as necessary.
+        """
+        insert_query = """
+        INSERT INTO points_of_interest (
+            poigroup, poitype, poiname, poilabel, shape, startdate, enddate, lastupdate
+        ) VALUES (
+            %s, %s, %s, %s, ST_SetSRID(ST_GeomFromText(%s), 4326), %s, %s, %s
         )
-        return poi_gdf
-    else:
-        print("Coordinate columns not found in POI data")
-        return gpd.GeoDataFrame()
+        ON CONFLICT (poiname, poilabel) DO NOTHING;
+        """
+        try:
+            with conn.cursor() as cur:
+                for poi in pois:
+                    attr = poi.get('attributes', {})
+                    geom = poi.get('geometry', None)
 
-# Main function to fetch POIs for all SA2 regions in selected SA4 zones
-def fetch_pois_for_sa4_zones(sa4_zones):
-    """
-    Fetch POIs for all SA2 regions within specified SA4 zones
-    
-    Parameters:
-    sa4_zones: List of SA4 zone names to process
-    
-    Returns:
-    GeoDataFrame containing all POIs with SA2 code assignments
-    """
-    # Connect to database
-    engine = connect_to_db()
-    
-    # Query SA2 boundaries for the selected SA4 zones
-    query = f"""
-    SELECT sa2_code, sa2_name, sa4_name, geometry 
-    FROM sa2_boundaries 
-    WHERE sa4_name IN ({', '.join([f"'{zone}'" for zone in sa4_zones])})
-    """
-    
-    # Load SA2 boundaries for selected SA4 zones
-    sa2_gdf = gpd.read_postgis(query, engine, geom_col='geometry')
-    
-    print(f"Found {len(sa2_gdf)} SA2 regions in the selected SA4 zones")
-    
-    # Initialize an empty list to store POI data for all SA2 regions
-    all_pois = []
-    
-    # Process each SA2 region
-    for idx, row in sa2_gdf.iterrows():
-        sa2_code = row['sa2_code']
-        sa2_name = row['sa2_name']
-        geometry = row['geometry']
+                    if geom is None:
+                        continue  # Skip POIs with no geometry
+
+                    data = (
+                        attr.get('poigroup'),
+                        attr.get('poitype', 'Unknown'),
+                        attr.get('poiname', 'Unknown'),
+                        attr.get('poilabel', 'Unknown'),
+                        f"POINT({geom['x']} {geom['y']})",
+                        attr.get('startdate'),
+                        attr.get('enddate'),
+                        attr.get('lastupdate')
+                    )
+
+                    try:
+                        cur.execute(insert_query, data)
+                    except Exception as e:
+                        print(f"⚠️ Insert error for POI {attr.get('poiname')}: {e}")
+                conn.commit()
+                print(f"✅ Inserted {len(pois)} POIs successfully.")
+        except Exception as e:
+            print(f"❌ Error during POI insertion: {e}")
+            conn.rollback()
+
+    def process_data(self):
+        print(f"📂 Reading Shapefile: {self.shapefile_path}...")
+        try:
+            gdf = gpd.read_file(self.shapefile_path, engine="pyogrio")
+            print("✅ Shapefile read successfully.")
+            return gdf
+        except Exception as e:
+            print(f"❌ Error reading Shapefile: {e}")
+            return None
+
+    def process_sa2_within_sa4(self, conn):
+        """
+        ii) Loop through SA2 regions within the selected SA4, get POIs for each,
+        wait 1 second between calls, and insert all POIs into the DB.
+        """
+        gdf = self.process_data()
+        if gdf is None:
+            return
         
-        print(f"Processing SA2: {sa2_name} ({sa2_code})...")
-        
-        # Get bounding box for the SA2 region
-        minx, miny, maxx, maxy = get_bounding_box(geometry)
-        
-        # Fetch POIs for this bounding box
-        poi_features = fetch_points_of_interest(minx, miny, maxx, maxy)
-        
-        # Process the response
-        poi_df = process_poi_response(poi_features)
-        
-        if not poi_df.empty:
-            # Add SA2 code and name to the POI data
-            poi_df['sa2_code'] = sa2_code
-            poi_df['sa2_name'] = sa2_name
-            
-            # Append to the list of all POIs
-            all_pois.append(poi_df)
-            
-            print(f"  Found {len(poi_df)} POIs")
-        else:
-            print(f"  No POIs found")
-        
-        # Wait before the next API request to avoid rate limiting
-        time.sleep(1)
-    
-    # Combine all POI data
-    if all_pois:
-        combined_poi_df = pd.concat(all_pois, ignore_index=True)
-        
-        # Create GeoDataFrame
-        poi_gdf = create_poi_geodataframe(combined_poi_df)
-        
-        # Import to PostgreSQL
-        poi_gdf.to_postgis("points_of_interest", engine, if_exists="replace", index=False)
-        
-        # Create spatial index
-        with engine.connect() as connection:
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_poi_geom ON points_of_interest USING GIST (geometry);")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_poi_sa2_code ON points_of_interest (sa2_code);")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_poi_poigroup ON points_of_interest (poigroup);")
-        
-        print(f"Successfully imported {len(poi_gdf)} POIs to PostgreSQL")
-        return poi_gdf
-    else:
-        print("No POIs found for any SA2 region")
-        return gpd.GeoDataFrame()
+        # Filter SA2 regions inside the selected SA4 region
+        sa2_within_sa4 = gdf[gdf['SA4_CODE21'] == self.selected_sa4]
+
+        for idx, row in sa2_within_sa4.iterrows():
+            sa2_code = row['SA2_CODE21']
+            bounds = row['geometry'].bounds  # returns (minx, miny, maxx, maxy)
+            min_lon, min_lat, max_lon, max_lat = bounds
+            print(f"📍 Processing POIs for SA2 {sa2_code}...")
+
+            pois = self.poi_api.get_poi_within_bbox(min_lat, min_lon, max_lat, max_lon)
+
+            if pois:
+                self.insert_pois(conn, pois)
+            else:
+                print(f"⚠️ No POIs found for SA2 {sa2_code}.")
+
+            time.sleep(1)  # wait 1 second to respect API limits
+
+# === Configuration ===
+db_config = {
+    'user': 'postgres',
+    'password': '1234',
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'postgres'
+}
+
+shapefile_path = 'data/SA2_2021_AUST_SHP_GDA2020/SA2_2021_AUST_GDA2020.shp'
+poi_api_url = "https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0"
+
+selected_sa4 = "11601"  
+poi_api = NSWPointsOfInterestAPI(poi_api_url)
+processor = SA2DataProcessor(db_config, shapefile_path, poi_api, selected_sa4)
+
+conn = processor.connect()
+if conn:
+    processor.process_sa2_within_sa4(conn)
+    conn.close()
