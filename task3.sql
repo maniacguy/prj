@@ -1,4 +1,10 @@
--- Optional: Create sigmoid function (if not already created)
+ALTER TABLE stops ADD COLUMN geom_4283 geometry(Point, 4283);
+
+UPDATE stops
+SET geom_4283 = ST_SetSRID(ST_MakePoint(longitude, latitude), 4283);
+
+CREATE INDEX stops_geom_idx ON stops USING GIST (geom_4283);
+
 CREATE OR REPLACE FUNCTION sigmoid(x double precision)
 RETURNS double precision AS $$
 BEGIN
