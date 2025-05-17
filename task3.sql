@@ -51,10 +51,10 @@ stop_metrics AS (
 population_filtered AS (
     SELECT
         sa2_code21 AS sa2_code21,
-        total_people AS population,
+        total_population AS population,
         population_0_19
     FROM populations
-    WHERE total_people >= 100
+    WHERE total_population >= 100
 ),
 
 -- Combine everything
