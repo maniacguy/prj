@@ -1,18 +1,12 @@
-ALTER TABLE stops ADD COLUMN geom_4283 geometry(Point, 4283);
-
-UPDATE stops
-SET geom_4283 = ST_SetSRID(ST_MakePoint(longitude, latitude), 4283);
-
-CREATE INDEX stops_geom_idx ON stops USING GIST (geom_4283);
-
-CREATE OR REPLACE FUNCTION sigmoid(x double precision)
-RETURNS double precision AS $$
+-- ✅ Tạo hàm sigmoid
+CREATE OR REPLACE FUNCTION sigmoid(x DOUBLE PRECISION)
+RETURNS DOUBLE PRECISION AS $$
 BEGIN
-  RETURN 1 / (1 + exp(-x));
+  RETURN 1 / (1 + EXP(-x));
 END;
 $$ LANGUAGE plpgsql;
 
--- === Metric Aggregation ===
+-- === TÍNH CHỈ SỐ ===
 
 WITH business_metrics AS (
     SELECT
@@ -53,28 +47,37 @@ stop_metrics AS (
     GROUP BY s.sa2_code21
 ),
 
--- Join population table
+-- ✅ Lọc bảng dân số, chuẩn hóa mã
 population_filtered AS (
     SELECT
-        sa2_code21 AS sa2_code21,
+        sa2_code21,
         total_population AS population,
         population_0_19
     FROM populations
     WHERE total_population >= 100
 ),
 
--- Combine everything
+-- ✅ Tổng hợp dữ liệu
 combined AS (
     SELECT
         s.sa2_code21,
-        b.business_count,
-        p.poi_count,
-        sc.school_count,
-        st.stop_count,
-        pop.population,
-        pop.population_0_19,
-        (b.business_count * 1000.0) / NULLIF(pop.population, 0) AS business_per_1000,
-        (sc.school_count * 1000.0) / NULLIF(pop.population_0_19, 0) AS schools_per_1000young
+        COALESCE(b.business_count, 0) AS business_count,
+        COALESCE(p.poi_count, 0) AS poi_count,
+        COALESCE(sc.school_count, 0) AS school_count,
+        COALESCE(st.stop_count, 0) AS stop_count,
+        COALESCE(pop.population, 0) AS population,
+        COALESCE(pop.population_0_19, 0) AS population_0_19,
+
+        -- ✅ Chia theo dân số/người trẻ
+        CASE 
+            WHEN COALESCE(pop.population, 0) > 0 THEN (COALESCE(b.business_count, 0) * 1000.0) / pop.population
+            ELSE 0
+        END AS business_per_1000,
+        
+        CASE 
+            WHEN COALESCE(pop.population_0_19, 0) > 0 THEN (COALESCE(sc.school_count, 0) * 1000.0) / pop.population_0_19
+            ELSE 0
+        END AS schools_per_1000young
     FROM sa2 s
     LEFT JOIN population_filtered pop ON s.sa2_code21 = pop.sa2_code21
     LEFT JOIN business_metrics b ON s.sa2_code21 = b.sa2_code21
@@ -83,29 +86,62 @@ combined AS (
     LEFT JOIN stop_metrics st ON s.sa2_code21 = st.sa2_code21
 ),
 
--- Z-score normalization
+-- Calculate averages and standard deviations first
+stats AS (
+    SELECT
+        AVG(business_per_1000) AS avg_business_per_1000,
+        STDDEV_SAMP(business_per_1000) AS stddev_business_per_1000,
+        AVG(poi_count) AS avg_poi_count,
+        STDDEV_SAMP(poi_count) AS stddev_poi_count,
+        AVG(schools_per_1000young) AS avg_schools_per_1000young,
+        STDDEV_SAMP(schools_per_1000young) AS stddev_schools_per_1000young,
+        AVG(stop_count) AS avg_stop_count,
+        STDDEV_SAMP(stop_count) AS stddev_stop_count
+    FROM combined
+    WHERE population > 0  -- Consider only areas with population
+),
+
+-- ✅ Tính z-score với xử lý NULL
 z_scores AS (
     SELECT
-        sa2_code21,
-        business_per_1000,
-        poi_count,
-        schools_per_1000young,
-        stop_count,
+        c.sa2_code21,
+        c.business_per_1000,
+        c.poi_count,
+        c.schools_per_1000young,
+        c.stop_count,
 
-        (business_per_1000 - AVG(business_per_1000) OVER()) / NULLIF(STDDEV_SAMP(business_per_1000) OVER(), 0) AS zbusiness,
-        (poi_count - AVG(poi_count) OVER()) / NULLIF(STDDEV_SAMP(poi_count) OVER(), 0) AS zpoi,
-        (schools_per_1000young - AVG(schools_per_1000young) OVER()) / NULLIF(STDDEV_SAMP(schools_per_1000young) OVER(), 0) AS zschools,
-        (stop_count - AVG(stop_count) OVER()) / NULLIF(STDDEV_SAMP(stop_count) OVER(), 0) AS zstops
-    FROM combined
+        -- Handle possible division by zero or NULL values
+        CASE
+            WHEN s.stddev_business_per_1000 IS NULL OR s.stddev_business_per_1000 = 0 THEN 0
+            ELSE (c.business_per_1000 - s.avg_business_per_1000) / s.stddev_business_per_1000
+        END AS zbusiness,
+        
+        CASE
+            WHEN s.stddev_poi_count IS NULL OR s.stddev_poi_count = 0 THEN 0
+            ELSE (c.poi_count - s.avg_poi_count) / s.stddev_poi_count
+        END AS zpoi,
+        
+        CASE
+            WHEN s.stddev_schools_per_1000young IS NULL OR s.stddev_schools_per_1000young = 0 THEN 0
+            ELSE (c.schools_per_1000young - s.avg_schools_per_1000young) / s.stddev_schools_per_1000young
+        END AS zschools,
+        
+        CASE
+            WHEN s.stddev_stop_count IS NULL OR s.stddev_stop_count = 0 THEN 0
+            ELSE (c.stop_count - s.avg_stop_count) / s.stddev_stop_count
+        END AS zstops
+    FROM combined c
+    CROSS JOIN stats s
+    WHERE c.population > 0  -- Only include populated areas
 )
 
--- Final score
+-- ✅ Tính điểm tổng
 SELECT
     sa2_code21,
-    ROUND(zbusiness, 2) AS zbusiness,
-    ROUND(zpoi, 2) AS zpoi,
-    ROUND(zschools, 2) AS zschools,
-    ROUND(zstops, 2) AS zstops,
-    ROUND(sigmoid(zbusiness + zpoi + zschools + zstops)::numeric, 4) AS final_score
+    ROUND(zbusiness::NUMERIC, 2) AS zbusiness,
+    ROUND(zpoi::NUMERIC, 2) AS zpoi,
+    ROUND(zschools::NUMERIC, 2) AS zschools,
+    ROUND(zstops::NUMERIC, 2) AS zstops,
+    ROUND(sigmoid(zbusiness + zpoi + zschools + zstops)::NUMERIC, 4) AS final_score
 FROM z_scores
 ORDER BY final_score DESC;
