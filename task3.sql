@@ -1,27 +1,22 @@
--- Only transform stops to match SRID
-DO $$
+-- Optional: Create sigmoid function (if not already created)
+CREATE OR REPLACE FUNCTION sigmoid(x double precision)
+RETURNS double precision AS $$
 BEGIN
-    BEGIN
-        ALTER TABLE stops DROP COLUMN IF EXISTS geometry;
-    EXCEPTION WHEN undefined_column THEN
-        RAISE NOTICE 'Geometry column did not exist.';
-    END;
+  RETURN 1 / (1 + exp(-x));
+END;
+$$ LANGUAGE plpgsql;
 
-    ALTER TABLE stops ADD COLUMN geometry GEOMETRY(Point, 4326);
-    UPDATE stops SET geometry = ST_SetSRID(ST_MakePoint(stop_lon, stop_lat), 4326);
+-- === Metric Aggregation ===
 
-    ALTER TABLE stops ADD COLUMN geom_4283 GEOMETRY(Point, 4283);
-    UPDATE stops SET geom_4283 = ST_Transform(geometry, 4283);
-END
-$$;
-
--- Compute z-scores and final score
 WITH business_metrics AS (
     SELECT
         s.sa2_code21,
         COUNT(b.*) AS business_count
     FROM sa2 s
     LEFT JOIN businesses b ON b.sa2_code = s.sa2_code21
+    WHERE b.industry_name ILIKE ANY (ARRAY[
+        '%Retail%', '%Health%', '%Education%', '%Accommodation%', '%Food%'
+    ])
     GROUP BY s.sa2_code21
 ),
 
@@ -30,7 +25,7 @@ poi_metrics AS (
         s.sa2_code21,
         COUNT(p.*) AS poi_count
     FROM sa2 s
-    LEFT JOIN points_of_interest p ON p.sa2_code = s.sa2_code21
+    LEFT JOIN poi_csv p ON p.sa2_code21 = s.sa2_code21
     GROUP BY s.sa2_code21
 ),
 
@@ -52,36 +47,59 @@ stop_metrics AS (
     GROUP BY s.sa2_code21
 ),
 
+-- Join population table
+population_filtered AS (
+    SELECT
+        sa2_code21 AS sa2_code21,
+        total_people AS population,
+        population_0_19
+    FROM populations
+    WHERE total_people >= 100
+),
+
+-- Combine everything
 combined AS (
     SELECT
         s.sa2_code21,
         b.business_count,
         p.poi_count,
         sc.school_count,
-        st.stop_count
+        st.stop_count,
+        pop.population,
+        pop.population_0_19,
+        (b.business_count * 1000.0) / NULLIF(pop.population, 0) AS business_per_1000,
+        (sc.school_count * 1000.0) / NULLIF(pop.population_0_19, 0) AS schools_per_1000young
     FROM sa2 s
+    LEFT JOIN population_filtered pop ON s.sa2_code21 = pop.sa2_code21
     LEFT JOIN business_metrics b ON s.sa2_code21 = b.sa2_code21
     LEFT JOIN poi_metrics p ON s.sa2_code21 = p.sa2_code21
     LEFT JOIN school_metrics sc ON s.sa2_code21 = sc.sa2_code21
     LEFT JOIN stop_metrics st ON s.sa2_code21 = st.sa2_code21
 ),
 
+-- Z-score normalization
 z_scores AS (
     SELECT
         sa2_code21,
-        business_count,
+        business_per_1000,
         poi_count,
-        school_count,
+        schools_per_1000young,
         stop_count,
-        (business_count - AVG(business_count) OVER()) / NULLIF(STDDEV(business_count) OVER(), 0) AS zbusiness,
-        (poi_count - AVG(poi_count) OVER()) / NULLIF(STDDEV(poi_count) OVER(), 0) AS zpoi,
-        (school_count - AVG(school_count) OVER()) / NULLIF(STDDEV(school_count) OVER(), 0) AS zschools,
-        (stop_count - AVG(stop_count) OVER()) / NULLIF(STDDEV(stop_count) OVER(), 0) AS zstops
+
+        (business_per_1000 - AVG(business_per_1000) OVER()) / NULLIF(STDDEV_SAMP(business_per_1000) OVER(), 0) AS zbusiness,
+        (poi_count - AVG(poi_count) OVER()) / NULLIF(STDDEV_SAMP(poi_count) OVER(), 0) AS zpoi,
+        (schools_per_1000young - AVG(schools_per_1000young) OVER()) / NULLIF(STDDEV_SAMP(schools_per_1000young) OVER(), 0) AS zschools,
+        (stop_count - AVG(stop_count) OVER()) / NULLIF(STDDEV_SAMP(stop_count) OVER(), 0) AS zstops
     FROM combined
 )
 
+-- Final score
 SELECT
-    *,
-    ROUND(1 / (1 + EXP(-(zbusiness + zpoi + zschools + zstops))), 4) AS final_score
+    sa2_code21,
+    ROUND(zbusiness, 2) AS zbusiness,
+    ROUND(zpoi, 2) AS zpoi,
+    ROUND(zschools, 2) AS zschools,
+    ROUND(zstops, 2) AS zstops,
+    ROUND(sigmoid(zbusiness + zpoi + zschools + zstops)::numeric, 4) AS final_score
 FROM z_scores
 ORDER BY final_score DESC;
