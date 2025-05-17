@@ -13,7 +13,7 @@ WITH business_metrics AS (
         s.sa2_code21,
         COUNT(b.*) AS business_count
     FROM sa2 s
-    LEFT JOIN businesses b ON b.sa2_code = s.sa2_code21
+    LEFT JOIN buss b ON b.sa2_code = s.sa2_code21
     WHERE b.industry_name ILIKE ANY (ARRAY[
         '%Retail%', '%Health%', '%Education%', '%Accommodation%', '%Food%'
     ])
